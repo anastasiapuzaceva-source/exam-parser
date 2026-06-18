@@ -53,12 +53,17 @@ def chat(messages, model, response_format=None, temperature=0,
     last_error = None
     for attempt in range(max_retries):
         _throttle()
-        response = requests.post(
-            url,
-            headers=_headers(),
-            json=payload,
-            timeout=config.REQUEST_TIMEOUT,
-        )
+        try:
+            response = requests.post(
+                url,
+                headers=_headers(),
+                json=payload,
+                timeout=config.REQUEST_TIMEOUT,
+            )
+        except requests.exceptions.RequestException as error:
+            last_error = str(error)
+            time.sleep(min(60, 4 * 2 ** attempt))
+            continue
         if response.status_code == 200:
             return response.json()['choices'][0]['message']['content']
         last_error = f'{response.status_code}: {response.text[:300]}'

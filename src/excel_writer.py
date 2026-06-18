@@ -6,8 +6,10 @@ from openpyxl import Workbook
 from openpyxl.cell.cell import ILLEGAL_CHARACTERS_RE
 from openpyxl.styles import Alignment, Font
 
-HEADERS = ['task_num', 'condition', 'image_name', 'solution', 'answer']
-WIDTHS = [10, 60, 16, 80, 18]
+HEADERS = [
+    'task_num', 'condition', 'image_name', 'solution', 'answer', 'category',
+]
+WIDTHS = [10, 60, 16, 80, 18, 28]
 
 
 def _clean(value):
@@ -33,6 +35,7 @@ def write_tasks(tasks, excel_path):
             _clean(task.get('image_name', '')),
             _clean(task.get('solution', '')),
             _clean(task.get('answer', '')),
+            _clean(task.get('category', '')),
         ])
     for index, width in enumerate(WIDTHS, start=1):
         column = sheet.cell(row=1, column=index).column_letter

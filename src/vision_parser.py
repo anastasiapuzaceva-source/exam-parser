@@ -3,56 +3,43 @@
 import json
 
 from . import config
-from .mistral_client import chat, encode_image
+from .mistral_client import MistralError, chat, encode_image
 from .schema import PAGE_SCHEMA
 
-PROMPT_HEAD = (
+PROMPT = (
     'Ты парсер экзаменационных листов ЕГЭ по математике. '
     'На изображении страница с задачами. Извлеки КАЖДУЮ задачу '
     'в порядке нумерации. Ничего не придумывай и не решай — '
     'только переноси существующий текст.\n'
+    'Координаты на изображении нормализованы: (0, 0) — левый '
+    'верхний угол страницы, (1, 1) — правый нижний.\n'
     'Для каждой задачи верни поля:\n'
     '- task_num: номер задачи строго как на листе (строка).\n'
     '- condition: полный текст условия. Все математические '
     'переменные, формулы и величины оберни в $...$ (LaTeX).\n'
-    '- figure_index: индекс области с рисунком этой задачи.\n'
-)
-
-PROMPT_REGIONS = (
-    'На странице автоматически найдены прямоугольные области с '
-    'рисунками (нормализованные координаты [x0, y0, x1, y1], где '
-    '(0, 0) — левый верхний угол страницы):\n{regions}\n'
-    'Для каждой задачи укажи figure_index — индекс относящейся к '
-    'ней области, или -1, если у задачи нет рисунка. Некоторые '
-    'области могут быть декоративными (логотип, QR-код, пример '
-    'бланка ответа) — их не назначай никакой задаче.'
-)
-
-PROMPT_NO_REGIONS = (
-    'На этой странице рисунки не обнаружены, поэтому для всех '
-    'задач figure_index равен -1.'
+    '- has_figure: true только если у задачи есть отдельный '
+    'графический объект — геометрический чертёж, график функции '
+    'или координатная плоскость с осями. Системы уравнений, дроби, '
+    'корни, скобки, матрицы и любые математические выражения — это '
+    'НЕ рисунок. Обычный текст, формулы и числа рисунком не '
+    'считаются.\n'
+    '- figure_box: максимально плотная рамка [x0, y0, x1, y1] '
+    'строго вокруг линий самого рисунка. Не включай в рамку текст '
+    'условия, номер задачи, пустые поля и соседние задачи. Веди '
+    'границы по крайним линиям чертежа. Если рисунка нет, верни '
+    '[0, 0, 0, 0].\n'
+    'Не считай рисунком таблицы ответов, логотипы, QR-коды и '
+    'образцы бланков.'
 )
 
 
-def _format_regions(candidates):
-    '''Форматирует рамки-кандидаты в нумерованный список.'''
-    if not candidates:
-        return PROMPT_NO_REGIONS
-    lines = []
-    for index, box in enumerate(candidates):
-        coords = ', '.join(f'{value:.2f}' for value in box)
-        lines.append(f'{index}: [{coords}]')
-    return PROMPT_REGIONS.format(regions='\n'.join(lines))
-
-
-def parse_page(image_path, candidates):
+def parse_page(image_path):
     '''Возвращает список задач, разобранных с одной страницы.'''
-    prompt = PROMPT_HEAD + _format_regions(candidates)
     messages = [
         {
             'role': 'user',
             'content': [
-                {'type': 'text', 'text': prompt},
+                {'type': 'text', 'text': PROMPT},
                 {
                     'type': 'image_url',
                     'image_url': encode_image(image_path),
@@ -60,9 +47,12 @@ def parse_page(image_path, candidates):
             ],
         }
     ]
-    content = chat(
-        messages,
-        model=config.VISION_MODEL,
-        response_format=PAGE_SCHEMA,
-    )
-    return json.loads(content)['tasks']
+    try:
+        content = chat(
+            messages,
+            model=config.VISION_MODEL,
+            response_format=PAGE_SCHEMA,
+        )
+        return json.loads(content)['tasks']
+    except (MistralError, json.JSONDecodeError, TypeError, KeyError):
+        return []

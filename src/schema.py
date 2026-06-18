@@ -18,12 +18,29 @@ PAGE_SCHEMA = {
                         'required': [
                             'task_num',
                             'condition',
-                            'figure_index',
+                            'has_figure',
+                            'figure_box',
                         ],
                         'properties': {
                             'task_num': {'type': 'string'},
                             'condition': {'type': 'string'},
-                            'figure_index': {'type': 'integer'},
+                            'has_figure': {
+                                'type': 'boolean',
+                                'description': (
+                                    'Есть ли у задачи рисунок, график '
+                                    'или чертёж на странице.'
+                                ),
+                            },
+                            'figure_box': {
+                                'type': 'array',
+                                'items': {'type': 'number'},
+                                'description': (
+                                    'Рамка рисунка [x0, y0, x1, y1] в '
+                                    'долях ширины и высоты страницы '
+                                    '(0..1, начало в левом верхнем углу). '
+                                    '[0, 0, 0, 0], если рисунка нет.'
+                                ),
+                            },
                         },
                     },
                 },
@@ -42,8 +59,21 @@ SOLUTION_SCHEMA = {
             'additionalProperties': False,
             'required': ['solution', 'answer'],
             'properties': {
-                'solution': {'type': 'string'},
-                'answer': {'type': 'string'},
+                'solution': {
+                    'type': 'string',
+                    'description': (
+                        'Пошаговое решение строго в HTML-тегах '
+                        '(<p>, <br>, <b>, <ul>, <li>) без Markdown; '
+                        'формулы только в одинарных $...$, без $$...$$.'
+                    ),
+                },
+                'answer': {
+                    'type': 'string',
+                    'description': (
+                        'Только число (целое или конечная десятичная '
+                        'дробь) без слов и единиц измерения.'
+                    ),
+                },
             },
         },
     },
