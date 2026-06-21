@@ -23,7 +23,16 @@ PAGE_SCHEMA = {
                         ],
                         'properties': {
                             'task_num': {'type': 'string'},
-                            'condition': {'type': 'string'},
+                            'condition': {
+                                'type': 'string',
+                                'description': (
+                                    'Условие задачи строго в HTML-тегах '
+                                    '(<p>, <br>, <b>, <ul>, <li>) без '
+                                    'Markdown; перечисления — списком '
+                                    '<ul><li>; формулы только в одинарных '
+                                    '$...$, без $$...$$.'
+                                ),
+                            },
                             'has_figure': {
                                 'type': 'boolean',
                                 'description': (

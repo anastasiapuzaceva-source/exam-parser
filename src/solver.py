@@ -1,15 +1,11 @@
 '''Решение разобранных задач: получение решения и ответа.'''
 
 import json
-import re
 
 from . import config
 from .mistral_client import MistralError, chat
 from .schema import SOLUTION_SCHEMA
-
-_BOLD_RE = re.compile(r'\*\*(.+?)\*\*')
-_HEADING_RE = re.compile(r'(?m)^\s{0,3}#{1,6}\s*')
-_NUMBER_RE = re.compile(r'-?\d+(?:[.,]\d+)?')
+from .textfmt import clean_html, clean_number
 
 PROMPT = (
     'Ты эксперт по математике, решающий задачи ЕГЭ профильного '
@@ -29,24 +25,6 @@ PROMPT = (
     'каких-либо слов и единиц измерения (без «рублей», «градусов», '
     '«кв. ед» и тому подобного).'
 )
-
-
-def _clean_solution(text):
-    '''Подчищает решение: HTML вместо Markdown и одинарные $...$.'''
-    text = text or ''
-    text = text.replace('$$', '$')
-    text = _BOLD_RE.sub(r'<b>\1</b>', text)
-    text = _HEADING_RE.sub('', text)
-    return text.strip()
-
-
-def _clean_answer(text):
-    '''Оставляет в ответе только число без слов и единиц.'''
-    text = (text or '').replace('$', '').strip()
-    match = _NUMBER_RE.search(text)
-    if match is None:
-        return text
-    return match.group(0).replace(',', '.')
 
 
 def solve_task(task_num, condition):
@@ -69,6 +47,6 @@ def solve_task(task_num, condition):
             'answer': '',
         }
     return {
-        'solution': _clean_solution(data.get('solution', '')),
-        'answer': _clean_answer(data.get('answer', '')),
+        'solution': clean_html(data.get('solution', '')),
+        'answer': clean_number(data.get('answer', '')),
     }

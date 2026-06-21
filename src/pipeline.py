@@ -5,14 +5,77 @@ import shutil
 import tempfile
 from pathlib import Path
 
-from . import config
+from . import config, larin_answers
 from .classifier import classify_task, load_categories
 from .cropper import crop_figure, save_native_image
 from .excel_writer import write_tasks
 from .pdf_figures import assign_figures, extract_page_figures
 from .pdf_render import render_pdf
 from .solver import solve_task
-from .vision_parser import parse_page
+from .textfmt import clean_html
+
+if config.PARSER_BACKEND == 'paddle':
+    from .paddle_parser import parse_page
+else:
+    from .vision_parser import parse_page
+
+_SUBPART_RE = re.compile(r'^\s*(\d+)\s*[А-Яа-яA-Za-z]\s*$')
+_TASK_NUM_RE = re.compile(r'\d+')
+
+
+def _task_int(task_num):
+    '''Возвращает первое целое из номера задачи или ``None``.'''
+    match = _TASK_NUM_RE.search(str(task_num or ''))
+    return int(match.group(0)) if match else None
+
+
+def _join_conditions(first, second):
+    '''Склеивает условия подпунктов в один HTML-блок по порядку.'''
+    first = (first or '').strip()
+    second = (second or '').strip()
+    if not first:
+        return second
+    if not second:
+        return first
+    return f'{first}\n{second}'
+
+
+def _merge_subparts(tasks):
+    '''Объединяет подпункты вида «13 А» и «13 Б» в одну задачу «13».'''
+    merged = []
+    index_by_base = {}
+    for task in tasks:
+        num = (task.get('task_num') or '').strip()
+        match = _SUBPART_RE.match(num)
+        if not match:
+            merged.append(task)
+            continue
+        base = match.group(1)
+        if base in index_by_base:
+            target = merged[index_by_base[base]]
+            target['condition'] = _join_conditions(
+                target.get('condition', ''), task.get('condition', ''),
+            )
+            if not target.get('has_figure') and task.get('has_figure'):
+                target['has_figure'] = True
+                target['figure_box'] = task.get('figure_box')
+        else:
+            new_task = dict(task)
+            new_task['task_num'] = base
+            index_by_base[base] = len(merged)
+            merged.append(new_task)
+    return merged
+
+
+def _apply_site_answers(rows, variant_stem):
+    '''Перезаписывает ответы заданий 1–12 значениями с сайта Ларина.'''
+    answers = larin_answers.fetch_answers(variant_stem)
+    if not answers:
+        return
+    for row in rows:
+        num = _task_int(row.get('task_num'))
+        if num is not None and num in answers:
+            row['answer'] = answers[num]
 
 
 def _safe_name(task_num, counter):
@@ -37,14 +100,19 @@ def _process_pages(page_paths, page_figures, categories, images_dir):
     '''Разбирает, вырезает, улучшает и решает задачи на всех страницах.'''
     rows = []
     counter = 0
+    last_num = 0
     total = len(page_paths)
     for page_index, page_path in enumerate(page_paths, start=1):
         print(f'[parse] page {page_index}/{total}')
-        tasks = parse_page(page_path)
         if page_index - 1 < len(page_figures):
             page = page_figures[page_index - 1]
         else:
             page = None
+        tasks = _merge_subparts(parse_page(page_path, page, last_num))
+        for task in tasks:
+            num = _task_int(task.get('task_num'))
+            if num is not None:
+                last_num = max(last_num, num)
         seeds = [
             task.get('figure_box') if task.get('has_figure') else None
             for task in tasks
@@ -53,7 +121,7 @@ def _process_pages(page_paths, page_figures, categories, images_dir):
         for task, match in zip(tasks, matches):
             counter += 1
             num = task.get('task_num', str(counter))
-            condition = task.get('condition', '')
+            condition = clean_html(task.get('condition', ''))
             image_name = ''
             if match is not None:
                 name = _safe_name(num, counter)
@@ -109,6 +177,7 @@ def process_file(path):
     else:
         print(f'[skip] {path.name}: unsupported file type')
         return None
+    _apply_site_answers(rows, path.stem)
     write_tasks(rows, excel_path)
     zip_path = _archive_result(result_dir)
     print(f'[done] {path.name} -> {zip_path} ({len(rows)} task(s))')

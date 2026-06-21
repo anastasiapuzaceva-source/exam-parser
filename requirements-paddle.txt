@@ -1,0 +1,8 @@
+paddlepaddle
+paddleocr>=3.0
+paddlex[ocr]>=3.7,<3.8
+pymupdf
+pillow
+openpyxl
+python-dotenv
+requests
