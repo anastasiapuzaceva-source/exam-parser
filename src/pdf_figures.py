@@ -38,8 +38,13 @@ def _clusters(rects):
             i = 0
             while i < len(rects):
                 b = rects[i]
-                if not (a[2] + _CLUSTER_PAD < b[0] or b[2] + _CLUSTER_PAD < a[0] or
-                        a[3] + _CLUSTER_PAD < b[1] or b[3] + _CLUSTER_PAD < a[1]):
+                disjoint = (
+                    a[2] + _CLUSTER_PAD < b[0]
+                    or b[2] + _CLUSTER_PAD < a[0]
+                    or a[3] + _CLUSTER_PAD < b[1]
+                    or b[3] + _CLUSTER_PAD < a[1]
+                )
+                if not disjoint:
                     a = [min(a[0], b[0]), min(a[1], b[1]),
                          max(a[2], b[2]), max(a[3], b[3])]
                     rects.pop(i)
@@ -64,7 +69,8 @@ def _native(document, xref, smask):
         image = image.convert('RGB')
         if smask:
             mask = fitz.Pixmap(document, smask)
-            alpha = Image.frombytes('L', (mask.width, mask.height), mask.samples)
+            alpha = Image.frombytes(
+                'L', (mask.width, mask.height), mask.samples)
             if alpha.size != image.size:
                 alpha = alpha.resize(image.size)
         if alpha is not None:
@@ -134,7 +140,10 @@ def _cluster_near(seed, strokes):
     ]
     if not strokes_2d:
         return None
-    best = max(_clusters(strokes_2d), key=lambda c: (c[2] - c[0]) * (c[3] - c[1]))
+    best = max(
+        _clusters(strokes_2d),
+        key=lambda c: (c[2] - c[0]) * (c[3] - c[1]),
+    )
     x0, y0, x1, y1 = best
     for s in inside:
         cx = (s[0] + s[2]) / 2
@@ -182,7 +191,8 @@ def _vector_candidates(strokes):
     for box in sorted(boxes, key=lambda b: -(b[2] - b[0]) * (b[3] - b[1])):
         w = box[2] - box[0]
         h = box[3] - box[1]
-        if w < _MIN_FIGURE or h < _MIN_FIGURE or w > _MAX_FIGURE or h > _MAX_FIGURE:
+        if (w < _MIN_FIGURE or h < _MIN_FIGURE
+                or w > _MAX_FIGURE or h > _MAX_FIGURE):
             continue
         if any(_overlap(box, kept) > 0.5 for kept in result):
             continue
@@ -312,7 +322,56 @@ def _candidate_pool(page):
     return pool
 
 
-def assign_figures(seeds, page):
+def _same_column(box, region):
+    '''Лежат ли кандидат и задача в одной колонке (по стороне от 0.5).'''
+    cx = (box[0] + box[2]) / 2
+    rcx = (region[0] + region[2]) / 2
+    return (cx < 0.5) == (rcx < 0.5)
+
+
+def _vertical_overlap(box, region):
+    '''Доля вертикального перекрытия рамки-кандидата с задачей (0..1).'''
+    inter = max(0.0, min(box[3], region[3]) - max(box[1], region[1]))
+    height = box[3] - box[1]
+    return inter / height if height > 0 else 0.0
+
+
+def _assign_by_region(result, regions, pool):
+    '''Привязывает кандидаты к задачам по вертикали в той же колонке.'''
+    if not regions or not pool:
+        return
+    used = [item['box'] for item in result if item]
+    def _area(candidate):
+        box = candidate['box']
+        return (box[2] - box[0]) * (box[3] - box[1])
+
+    ordered = sorted(pool, key=_area, reverse=True)
+    for candidate in ordered:
+        box = candidate['box']
+        if box[2] - box[0] < _MIN_FIGURE or box[3] - box[1] < _MIN_FIGURE:
+            continue
+        if any(_overlap(box, taken) > 0.3 for taken in used):
+            continue
+        best_index = None
+        best_overlap = 0.0
+        for index, region in enumerate(regions):
+            if index >= len(result) or result[index] is not None or not region:
+                continue
+            if not _same_column(box, region):
+                continue
+            overlap = _vertical_overlap(box, region)
+            if overlap > best_overlap:
+                best_overlap = overlap
+                best_index = index
+        if best_index is not None and best_overlap > 0:
+            result[best_index] = {
+                'box': list(box),
+                'image': candidate.get('image'),
+            }
+            used.append(box)
+
+
+def assign_figures(seeds, page, regions=None):
     '''Распределяет рамки рисунков по задачам без повторного использования.'''
     result = [None] * len(seeds)
     normalized = []
@@ -321,8 +380,6 @@ def assign_figures(seeds, page):
             x0, x1 = sorted((seed[0], seed[2]))
             y0, y1 = sorted((seed[1], seed[3]))
             normalized.append((index, [x0, y0, x1, y1]))
-    if not normalized:
-        return result
     if not page:
         for index, seed in normalized:
             result[index] = {'box': seed, 'image': None}
@@ -333,7 +390,7 @@ def assign_figures(seeds, page):
         candidate for candidate in _candidate_pool(page)
         if _word_count(candidate['box'], words) <= _MAX_WORDS
     ]
-    if pool:
+    if normalized and pool:
         big = 100.0
         size = max(len(normalized), len(pool))
         cost = [[big] * size for _ in range(size)]
@@ -360,4 +417,5 @@ def assign_figures(seeds, page):
                for other in result):
             continue
         result[index] = {'box': box, 'image': None}
+    _assign_by_region(result, regions, pool)
     return result

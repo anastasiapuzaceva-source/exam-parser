@@ -1,13 +1,17 @@
-'''Получение ответов части 1 (задания 1–12) с сайта Ларина.'''
+'''Ответы с сайта Ларина: часть 1 (1–12) из JS, часть 2 из картинки.'''
 
 import re
+import tempfile
+from pathlib import Path
 
 import requests
 
 from . import config
+from .paddle_parser import recognize_answer_table
 from .textfmt import clean_number
 
 _ANSWERS_URL = 'https://alexlarin.net/ege/{year}/{stem}.js'
+_IMAGE_URL = 'https://alexlarin.net/ege/{year}/{stem}.png'
 _PAGE_URL = 'https://alexlarin.net/ege/{year}/{stem}.html'
 
 _STEM_RE = re.compile(r'^trvar\d+$', re.IGNORECASE)
@@ -20,6 +24,7 @@ _ASSIGN_RE = re.compile(
 _DIGITS = '0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ'
 
 _cache = {}
+_image_cache = {}
 
 
 def _base(number, radix):
@@ -99,4 +104,41 @@ def fetch_answers(variant_stem):
         print(f'[larin] unpack error for {stem}: {error}')
         answers = {}
     _cache[stem] = answers
+    return answers
+
+
+def fetch_part2_answers(variant_stem):
+    '''Возвращает ``{номер_задания: ответ}`` части 2 из картинки варианта.'''
+    stem = (variant_stem or '').strip()
+    if not _STEM_RE.match(stem):
+        return {}
+    if stem in _image_cache:
+        return _image_cache[stem]
+    headers = {
+        'User-Agent': 'Mozilla/5.0',
+        'Referer': _PAGE_URL.format(year=config.LARIN_YEAR, stem=stem),
+    }
+    try:
+        response = requests.get(
+            _IMAGE_URL.format(year=config.LARIN_YEAR, stem=stem),
+            headers=headers,
+            timeout=config.REQUEST_TIMEOUT,
+        )
+    except requests.exceptions.RequestException:
+        _image_cache[stem] = {}
+        return {}
+    if response.status_code != 200:
+        _image_cache[stem] = {}
+        return {}
+    with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as handle:
+        handle.write(response.content)
+        tmp_path = handle.name
+    try:
+        answers = recognize_answer_table(tmp_path)
+    except Exception as error:
+        print(f'[larin] part2 recognize error for {stem}: {error}')
+        answers = {}
+    finally:
+        Path(tmp_path).unlink(missing_ok=True)
+    _image_cache[stem] = answers
     return answers

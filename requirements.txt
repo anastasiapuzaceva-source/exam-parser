@@ -1,5 +1,0 @@
-pymupdf
-pillow
-openpyxl
-python-dotenv
-requests

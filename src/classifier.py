@@ -1,11 +1,10 @@
 '''Классификация задач по категориям из CSV-справочника.'''
 
 import csv
-import json
 from pathlib import Path
 
 from . import config
-from .mistral_client import MistralError, chat
+from .llm_client import LLMError, chat
 
 _NAME_COLUMNS = ('category', 'категория', 'тема', 'topic', 'name', 'название')
 _DESC_COLUMNS = ('description', 'описание', 'desc', 'keywords', 'комментарий')
@@ -42,25 +41,6 @@ def load_categories(csv_path=None):
     return categories
 
 
-def _schema(names):
-    '''Строит схему ответа с фиксированным списком категорий.'''
-    return {
-        'type': 'json_schema',
-        'json_schema': {
-            'name': 'task_category',
-            'strict': True,
-            'schema': {
-                'type': 'object',
-                'additionalProperties': False,
-                'required': ['category'],
-                'properties': {
-                    'category': {'type': 'string', 'enum': names},
-                },
-            },
-        },
-    }
-
-
 def classify_task(task_num, condition, categories):
     '''Возвращает категорию задачи из справочника или пустую строку.'''
     if not categories:
@@ -73,8 +53,8 @@ def classify_task(task_num, condition, categories):
     )
     prompt = (
         'Ты классификатор задач ЕГЭ по математике. Отнеси задачу строго '
-        'к одной из категорий ниже и верни поле category с её названием '
-        'без изменений.\n' + listing
+        'к одной из категорий ниже и верни ТОЛЬКО название категории без '
+        'изменений, без пояснений и кавычек.\n' + listing
     )
     messages = [
         {'role': 'system', 'content': prompt},
@@ -84,9 +64,14 @@ def classify_task(task_num, condition, categories):
         content = chat(
             messages,
             model=config.CLASSIFIER_MODEL,
-            response_format=_schema(names),
+            max_tokens=64,
         )
-        category = json.loads(content).get('category', '')
-    except (MistralError, json.JSONDecodeError, TypeError):
+    except (LLMError, TypeError):
         return ''
-    return category if category in names else ''
+    text = (content or '').strip().strip('"\'')
+    if text in names:
+        return text
+    for name in names:
+        if name in text:
+            return name
+    return ''

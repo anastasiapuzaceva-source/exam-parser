@@ -3,6 +3,7 @@
 import re
 import shutil
 import tempfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 from . import config, larin_answers
@@ -10,16 +11,12 @@ from .classifier import classify_task, load_categories
 from .cropper import crop_figure, save_native_image
 from .excel_writer import write_tasks
 from .pdf_figures import assign_figures, extract_page_figures
+from .paddle_parser import parse_page
 from .pdf_render import render_pdf
 from .solver import solve_task
 from .textfmt import clean_html
 
-if config.PARSER_BACKEND == 'paddle':
-    from .paddle_parser import parse_page
-else:
-    from .vision_parser import parse_page
-
-_SUBPART_RE = re.compile(r'^\s*(\d+)\s*[А-Яа-яA-Za-z]\s*$')
+_SUBPART_RE = re.compile(r'^\s*(\d+)[\s.)]*[А-Яа-яA-Za-z][\s.)]*$')
 _TASK_NUM_RE = re.compile(r'\d+')
 
 
@@ -67,15 +64,21 @@ def _merge_subparts(tasks):
     return merged
 
 
-def _apply_site_answers(rows, variant_stem):
-    '''Перезаписывает ответы заданий 1–12 значениями с сайта Ларина.'''
-    answers = larin_answers.fetch_answers(variant_stem)
-    if not answers:
+def _site_answers(variant_stem):
+    '''Ответы Ларина одним словарём: 1–12 из JS, 13+ из картинки.'''
+    answers = dict(larin_answers.fetch_answers(variant_stem))
+    answers.update(larin_answers.fetch_part2_answers(variant_stem))
+    return answers
+
+
+def _apply_site_answers(rows, site_answers):
+    '''Перезаписывает столбец ``answer`` значениями с сайта Ларина.'''
+    if not site_answers:
         return
     for row in rows:
         num = _task_int(row.get('task_num'))
-        if num is not None and num in answers:
-            row['answer'] = answers[num]
+        if num is not None and num in site_answers:
+            row['answer'] = site_answers[num]
 
 
 def _safe_name(task_num, counter):
@@ -96,9 +99,9 @@ def _save_figure(match, page_path, image_name, images_dir):
     return crop_figure(page_path, match['box'], image_name, images_dir)
 
 
-def _process_pages(page_paths, page_figures, categories, images_dir):
-    '''Разбирает, вырезает, улучшает и решает задачи на всех страницах.'''
-    rows = []
+def _parse_all_pages(page_paths, page_figures, images_dir):
+    '''Парсинг страниц и вырезка рисунков (последовательно, без LLM).'''
+    records = []
     counter = 0
     last_num = 0
     total = len(page_paths)
@@ -117,7 +120,8 @@ def _process_pages(page_paths, page_figures, categories, images_dir):
             task.get('figure_box') if task.get('has_figure') else None
             for task in tasks
         ]
-        matches = assign_figures(seeds, page)
+        regions = [task.get('region') for task in tasks]
+        matches = assign_figures(seeds, page, regions)
         for task, match in zip(tasks, matches):
             counter += 1
             num = task.get('task_num', str(counter))
@@ -128,17 +132,47 @@ def _process_pages(page_paths, page_figures, categories, images_dir):
                 saved = _save_figure(match, page_path, name, images_dir)
                 if saved is not None:
                     image_name = name
-            print(f'[solve] task {num}')
-            solved = solve_task(num, condition)
-            category = classify_task(num, condition, categories)
-            rows.append({
+            records.append({
                 'task_num': num,
                 'condition': condition,
                 'image_name': image_name,
-                'solution': solved.get('solution', ''),
-                'answer': solved.get('answer', ''),
-                'category': category,
             })
+    return records
+
+
+def _solve_record(record, categories, site_answers):
+    '''Решает и классифицирует одну задачу; собирает строку результата.'''
+    num = record['task_num']
+    condition = record['condition']
+    print(f'[solve] task {num}')
+    hint = site_answers.get(_task_int(num))
+    solved = solve_task(num, condition, answer_hint=hint)
+    category = classify_task(num, condition, categories)
+    return {
+        'task_num': num,
+        'condition': condition,
+        'image_name': record['image_name'],
+        'solution': solved.get('solution', ''),
+        'answer': solved.get('answer', ''),
+        'category': category,
+    }
+
+
+def _process_pages(page_paths, page_figures, categories, images_dir,
+                   site_answers=None):
+    '''Парсит последовательно, решает параллельно (SOLVER_WORKERS потоков).'''
+    site_answers = site_answers or {}
+    records = _parse_all_pages(page_paths, page_figures, images_dir)
+    rows = [None] * len(records)
+    workers = max(1, config.SOLVER_WORKERS)
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = {
+            executor.submit(
+                _solve_record, record, categories, site_answers): index
+            for index, record in enumerate(records)
+        }
+        for future in as_completed(futures):
+            rows[futures[future]] = future.result()
     return rows
 
 
@@ -153,9 +187,7 @@ def _archive_result(result_dir):
 
 
 def process_file(path):
-    '''
-    Обрабатывает один входной файл в одноимённую папку результата.
-    '''
+    '''Обрабатывает один входной файл в одноимённую папку результата.'''
     path = Path(path)
     suffix = path.suffix.lower()
     result_dir = config.OUTPUT_DIR / path.stem
@@ -165,19 +197,26 @@ def process_file(path):
         shutil.rmtree(result_dir)
     print(f'[file] {path.name}')
     categories = load_categories()
+    site_answers = _site_answers(path.stem)
+    if not site_answers:
+        print(f'[warn] нет ответов с сайта Ларина для {path.stem} '
+              '(ожидается trvarNNN)')
     if suffix == '.pdf':
         page_figures = extract_page_figures(path)
         with tempfile.TemporaryDirectory() as tmp:
             page_paths = render_pdf(path, tmp)
             rows = _process_pages(
                 page_paths, page_figures, categories, images_dir,
+                site_answers,
             )
     elif suffix in config.IMAGE_EXTENSIONS:
-        rows = _process_pages([path], [None], categories, images_dir)
+        rows = _process_pages(
+            [path], [None], categories, images_dir, site_answers,
+        )
     else:
         print(f'[skip] {path.name}: unsupported file type')
         return None
-    _apply_site_answers(rows, path.stem)
+    _apply_site_answers(rows, site_answers)
     write_tasks(rows, excel_path)
     zip_path = _archive_result(result_dir)
     print(f'[done] {path.name} -> {zip_path} ({len(rows)} task(s))')

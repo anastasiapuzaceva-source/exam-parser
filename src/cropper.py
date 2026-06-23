@@ -9,9 +9,7 @@ _WEBP_QUALITY = 90
 
 
 def crop_figure(page_path, box, image_name, images_dir, padding=0.012):
-    '''
-    Вырезает нормализованную рамку со страницы и сохраняет в WebP.
-    '''
+    '''Вырезает нормализованную рамку со страницы и сохраняет в WebP.'''
     if not box or len(box) != 4:
         return None
     images_dir = Path(images_dir)

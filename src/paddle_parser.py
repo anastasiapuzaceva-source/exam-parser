@@ -1,6 +1,9 @@
 '''Локальный парсер страницы на PaddleOCR (PP-StructureV3).'''
 
 import re
+import tempfile
+from contextlib import contextmanager
+from pathlib import Path
 
 from PIL import Image
 
@@ -17,9 +20,12 @@ _SKIP_LABELS = {'table', 'table_title', 'header', 'footer', 'page_number',
                 'seal', 'aside_text', 'reference'}
 
 _TASK_NUM_RE = re.compile(r'^\s*(\d{1,2})\s*([А-Яа-яA-Za-z])?\s*[.)](?!\d)\s*')
+_LEADING_NUM_RE = re.compile(r'^\s*\d{1,2}\s*[.)]?\s*')
+_ANSWER_RE = re.compile(r'^\s*ответ\b', re.IGNORECASE)
 _BULLET_RE = re.compile(r'^\s*(?:[–—•\-]|[а-яё]\)|\d+\))\s+')
 _NOISE_RE = re.compile(
-    r'(alexlarin|единый\s+государственный|ответ\s*[:\-]|©|часть\s+\d)',
+    r'(alexlarin|государственн\w*\s+экзамен|математика,?\s*\d+\s*класс|'
+    r'не\s+забудьте|бланк\s+ответ|©|часть\s+\d)',
     re.IGNORECASE,
 )
 
@@ -32,9 +38,41 @@ def _get_engine():
         _engine = PPStructureV3(
             lang=config.PADDLE_LANG,
             use_formula_recognition=True,
+            formula_recognition_model_name=config.PADDLE_FORMULA_MODEL,
+            use_doc_orientation_classify=False,
+            use_doc_unwarping=False,
+            use_textline_orientation=False,
+            use_seal_recognition=False,
+            use_chart_recognition=False,
             device='gpu' if config.PADDLE_USE_GPU else 'cpu',
+            enable_mkldnn=False,
         )
     return _engine
+
+
+@contextmanager
+def _inference_image(image_path):
+    '''Изображение для инференса с длинной стороной не больше лимита.'''
+    limit = config.PADDLE_MAX_SIDE
+    with Image.open(image_path) as image:
+        width, height = image.size
+        if limit <= 0 or max(width, height) <= limit:
+            yield str(image_path), width, height
+            return
+        scale = limit / max(width, height)
+        new_size = (
+            max(1, round(width * scale)),
+            max(1, round(height * scale)),
+        )
+        resized = image.convert('RGB').resize(new_size, Image.LANCZOS)
+    handle = tempfile.NamedTemporaryFile(suffix='.png', delete=False)
+    handle.close()
+    tmp_path = handle.name
+    try:
+        resized.save(tmp_path)
+        yield tmp_path, new_size[0], new_size[1]
+    finally:
+        Path(tmp_path).unlink(missing_ok=True)
 
 
 def _result_blocks(result):
@@ -79,7 +117,8 @@ def _to_items(blocks, width, height):
     for block in blocks:
         label = (_block_field(block, 'block_label', 'label', 'type') or '')
         label = str(label).lower()
-        content = _block_field(block, 'block_content', 'content', 'text', 'res')
+        content = _block_field(
+            block, 'block_content', 'content', 'text', 'res')
         box = _block_field(block, 'block_bbox', 'bbox', 'box')
         if label in _FORMULA_LABELS:
             kind = 'formula'
@@ -126,7 +165,9 @@ def _join_inline(run):
 
 def _list_html(text):
     '''Собирает <ul><li>…</li></ul> из многострочного текста списка.'''
-    lines = [line.strip() for line in (text or '').splitlines() if line.strip()]
+    lines = [
+        line.strip() for line in (text or '').splitlines() if line.strip()
+    ]
     items = [_BULLET_RE.sub('', line) for line in lines] or [text.strip()]
     body = ''.join(f'<li>{item}</li>' for item in items if item)
     return f'<ul>{body}</ul>' if body else ''
@@ -167,6 +208,20 @@ def _build_condition_html(items):
     return clean_html('\n'.join(parts))
 
 
+def _task_region(items):
+    '''Рамка [x0,y0,x1,y1] задачи по боксам её элементов.'''
+    boxes = [item['box'] for item in items
+             if item.get('box') and item['box'] != [0, 0, 0, 0]]
+    if not boxes:
+        return None
+    return [
+        min(b[0] for b in boxes),
+        min(b[1] for b in boxes),
+        max(b[2] for b in boxes),
+        max(b[3] for b in boxes),
+    ]
+
+
 def _figure_box(items):
     '''Возвращает (has_figure, figure_box) по элементам-рисункам задачи.'''
     for item in items:
@@ -182,35 +237,60 @@ def _strip_task_number(text):
     return _TASK_NUM_RE.sub('', text or '', count=1)
 
 
+def _strip_leading_num(text):
+    '''Срезает ведущий номер, даже искажённый (как «3Прямая» без точки).'''
+    return _LEADING_NUM_RE.sub('', text or '', count=1)
+
+
 _MAX_TASK = config.PADDLE_MAX_TASK
 
 
 def _segment_tasks(items, start_num):
-    '''Делит элементы на задачи по номерам.'''
+    '''Делит элементы на задачи по разделителю «Ответ:».'''
     tasks = []
-    current = None
-    last = start_num
+    state = {'current': None, 'last': start_num, 'expect_new': False}
+
+    def start_task(num, first_text, box):
+        state['last'] = num
+        current = {
+            'task_num': str(num),
+            'items': [{'kind': 'text', 'text': first_text, 'box': box}],
+        }
+        tasks.append(current)
+        state['current'] = current
+        state['expect_new'] = False
+
+    def append(item):
+        if state['current'] is not None:
+            state['current']['items'].append(item)
+
     for item in items:
-        text = item['text']
-        if item['kind'] == 'text' and _NOISE_RE.search(text or ''):
+        if item['kind'] != 'text':
+            append(item)
             continue
-        match = _TASK_NUM_RE.match(text or '') if item['kind'] == 'text' else None
-        if match and last < int(match.group(1)) <= _MAX_TASK:
-            last = int(match.group(1))
-            stripped = dict(item, text=_strip_task_number(text))
-            current = {'task_num': str(last), 'items': [stripped]}
-            tasks.append(current)
-        elif current is not None:
-            current['items'].append(item)
+        text = item['text'] or ''
+        if _ANSWER_RE.match(text):
+            state['expect_new'] = True
+            continue
+        if _NOISE_RE.search(text):
+            continue
+        match = _TASK_NUM_RE.match(text)
+        num = int(match.group(1)) if match else None
+        if num is not None and state['last'] < num <= _MAX_TASK:
+            start_task(num, _strip_task_number(text), item['box'])
+        elif state['expect_new'] and state['last'] < _MAX_TASK:
+            start_task(
+                state['last'] + 1, _strip_leading_num(text), item['box'])
+        else:
+            append(item)
     return tasks
 
 
 def parse_page(image_path, page=None, start_num=0):
-    '''Возвращает список задач со страницы (контракт vision_parser.parse_page).'''
+    '''Возвращает список задач со страницы варианта.'''
     try:
-        with Image.open(image_path) as image:
-            width, height = image.size
-        result = next(iter(_get_engine().predict(str(image_path))), None)
+        with _inference_image(image_path) as (infer_path, width, height):
+            result = next(iter(_get_engine().predict(infer_path)), None)
         if result is None:
             return []
         items = _to_items(_result_blocks(result), width, height)
@@ -228,8 +308,79 @@ def parse_page(image_path, page=None, start_num=0):
             'condition': condition,
             'has_figure': has_figure,
             'figure_box': box,
+            'region': _task_region(task['items']),
         })
     return tasks
+
+
+_TR_RE = re.compile(r'<tr>(.*?)</tr>', re.S)
+_TD_RE = re.compile(r'<td[^>]*>(.*?)</td>', re.S)
+
+_SUBLABEL_RE = re.compile(r'\\left\(\s*\\mathrm\{[^{}]{1,3}\}\s*\\right\)')
+_FRAC_RE = re.compile(r'\\frac\{([^{}]*)\}\{([^{}]*)\}')
+_SQRT_RE = re.compile(r'\\sqrt\{([^{}]*)\}')
+_RU_LABELS = ['А', 'Б', 'В', 'Г']
+_LATEX_SYMBOLS = [
+    (r'\\pm', '±'), (r'\\mp', '∓'), (r'\\cdot', '·'), (r'\\times', '×'),
+    (r'\\infty', '∞'), (r'\\leqslant', '≤'), (r'\\geqslant', '≥'),
+    (r'\\leq', '≤'), (r'\\geq', '≥'), (r'\\neq', '≠'), (r'\\notin', '∉'),
+    (r'\\in', '∈'), (r'\\cup', '∪'), (r'\\cap', '∩'), (r'\\pi', 'π'),
+    (r'\\circ', '°'), (r'\\ldots', '…'), (r'\\dots', '…'),
+]
+
+
+def _clean_answer(text):
+    '''Делает ответ части 2 читаемым: LaTeX-шум → юникод/текст.'''
+    text = text or ''
+    seq = [0]
+
+    def _label(_match):
+        index = seq[0]
+        seq[0] += 1
+        return f'{_RU_LABELS[index]}) ' if index < len(_RU_LABELS) else ' '
+
+    text = _SUBLABEL_RE.sub(_label, text)
+    text = _SQRT_RE.sub(r'√\1', text)
+    text = _FRAC_RE.sub(r'\1/\2', text)
+    text = text.replace('\\left', '').replace('\\right', '')
+    text = re.sub(r'\\mathrm\{([^{}]*)\}', r'\1', text)
+    for pattern, char in _LATEX_SYMBOLS:
+        text = re.sub(pattern, char, text)
+    text = re.sub(r'(?<!\\)[{}]', '', text)
+    text = text.replace('\\{', '{').replace('\\}', '}').replace('\\|', '|')
+    text = re.sub(r'\\(?:quad|qquad|,|;|:|!| )', ' ', text)
+    text = text.replace('$', '')
+    return re.sub(r'\s+', ' ', text).strip()
+
+
+def recognize_answer_table(image_path):
+    '''Распознаёт таблицу ответов части 2 → {номер: html_ответ}.'''
+    try:
+        with _inference_image(image_path) as (infer_path, _w, _h):
+            result = next(iter(_get_engine().predict(infer_path)), None)
+        if result is None:
+            return {}
+        blocks = _result_blocks(result)
+    except Exception as error:
+        print(f'[paddle] answer table error: {error}')
+        return {}
+    answers = {}
+    for block in blocks:
+        label = (_block_field(block, 'block_label', 'label', 'type') or '')
+        if str(label).lower() != 'table':
+            continue
+        html = _block_field(block, 'block_content', 'content', 'text') or ''
+        for row in _TR_RE.findall(html):
+            cells = _TD_RE.findall(row)
+            if len(cells) < 2:
+                continue
+            num_match = re.search(r'\d+', cells[0])
+            if not num_match:
+                continue
+            answer = _clean_answer(clean_html(cells[1]))
+            if answer:
+                answers[int(num_match.group(0))] = answer
+    return answers
 
 
 def _qa_flag(task_num, condition):
