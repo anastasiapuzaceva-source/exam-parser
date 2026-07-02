@@ -65,6 +65,8 @@ def classify_task(task_num, condition, categories):
             messages,
             model=config.CLASSIFIER_MODEL,
             max_tokens=64,
+            base_url=config.CLASSIFIER_BASE_URL,
+            api_key=config.CLASSIFIER_API_KEY,
         )
     except (LLMError, TypeError):
         return ''

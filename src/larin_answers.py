@@ -25,6 +25,40 @@ _DIGITS = '0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ'
 
 _cache = {}
 _image_cache = {}
+_year_cache = {}
+
+
+def _resolve_year(stem):
+    '''Находит год на сайте Ларина, под которым лежит вариант (по ``.js``).'''
+    if stem in _year_cache:
+        return _year_cache[stem]
+    headers = {'User-Agent': 'Mozilla/5.0'}
+    top = int(config.LARIN_YEAR)
+    for year in range(top, config.LARIN_YEAR_MIN - 1, -1):
+        url = _ANSWERS_URL.format(year=year, stem=stem)
+        headers['Referer'] = _PAGE_URL.format(year=year, stem=stem)
+        try:
+            response = requests.head(
+                url,
+                headers=headers,
+                timeout=config.REQUEST_TIMEOUT,
+                allow_redirects=True,
+            )
+            if response.status_code != 200:
+                response = requests.get(
+                    url,
+                    headers=headers,
+                    timeout=config.REQUEST_TIMEOUT,
+                    stream=True,
+                )
+                response.close()
+        except requests.exceptions.RequestException:
+            continue
+        if response.status_code == 200:
+            _year_cache[stem] = year
+            return year
+    _year_cache[stem] = None
+    return None
 
 
 def _base(number, radix):
@@ -77,13 +111,17 @@ def fetch_answers(variant_stem):
         return {}
     if stem in _cache:
         return _cache[stem]
+    year = _resolve_year(stem)
+    if year is None:
+        _cache[stem] = {}
+        return {}
     headers = {
         'User-Agent': 'Mozilla/5.0',
-        'Referer': _PAGE_URL.format(year=config.LARIN_YEAR, stem=stem),
+        'Referer': _PAGE_URL.format(year=year, stem=stem),
     }
     try:
         response = requests.get(
-            _ANSWERS_URL.format(year=config.LARIN_YEAR, stem=stem),
+            _ANSWERS_URL.format(year=year, stem=stem),
             headers=headers,
             timeout=config.REQUEST_TIMEOUT,
         )
@@ -114,13 +152,17 @@ def fetch_part2_answers(variant_stem):
         return {}
     if stem in _image_cache:
         return _image_cache[stem]
+    year = _resolve_year(stem)
+    if year is None:
+        _image_cache[stem] = {}
+        return {}
     headers = {
         'User-Agent': 'Mozilla/5.0',
-        'Referer': _PAGE_URL.format(year=config.LARIN_YEAR, stem=stem),
+        'Referer': _PAGE_URL.format(year=year, stem=stem),
     }
     try:
         response = requests.get(
-            _IMAGE_URL.format(year=config.LARIN_YEAR, stem=stem),
+            _IMAGE_URL.format(year=year, stem=stem),
             headers=headers,
             timeout=config.REQUEST_TIMEOUT,
         )

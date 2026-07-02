@@ -16,6 +16,7 @@ _MIN_FIGURE = 0.06
 _MAX_FIGURE = 0.6
 _MATCH_GAP = 0.10
 _MAX_WORDS = 6
+_MIN_STROKES = 3
 
 
 def _norm(rect, rotation, width, height):
@@ -254,6 +255,30 @@ def _word_count(box, words):
     return count
 
 
+def _stroke_hits(box, strokes):
+    '''Считает 2D-штрихи, чьи центры попадают внутрь рамки.'''
+    count = 0
+    for s in strokes:
+        if s[2] - s[0] < _STROKE_2D or s[3] - s[1] < _STROKE_2D:
+            continue
+        cx = (s[0] + s[2]) / 2
+        cy = (s[1] + s[3]) / 2
+        if box[0] <= cx <= box[2] and box[1] <= cy <= box[3]:
+            count += 1
+    return count
+
+
+def _is_figure_candidate(candidate, strokes, words):
+    '''Отличает рисунок/график от обведённого рамкой текста.'''
+    if candidate.get('image'):
+        return True
+    box = candidate['box']
+    hits = _stroke_hits(box, strokes)
+    if hits >= _MIN_STROKES:
+        return True
+    return hits >= 1 and _word_count(box, words) == 0
+
+
 def _center_distance(a, b):
     '''Возвращает расстояние между центрами двух рамок.'''
     ax, ay = (a[0] + a[2]) / 2, (a[1] + a[3]) / 2
@@ -389,6 +414,7 @@ def assign_figures(seeds, page, regions=None):
     pool = [
         candidate for candidate in _candidate_pool(page)
         if _word_count(candidate['box'], words) <= _MAX_WORDS
+        and _is_figure_candidate(candidate, strokes, words)
     ]
     if normalized and pool:
         big = 100.0

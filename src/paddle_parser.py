@@ -11,6 +11,7 @@ from . import config
 from .textfmt import clean_html
 
 _engine = None
+_force_cpu = False
 
 _TEXT_LABELS = {'text', 'paragraph', 'paragraph_title', 'title', 'abstract'}
 _FORMULA_LABELS = {'formula', 'formula_number', 'equation', 'inline_formula'}
@@ -35,6 +36,7 @@ def _get_engine():
     global _engine
     if _engine is None:
         from paddleocr import PPStructureV3
+        use_gpu = config.PADDLE_USE_GPU and not _force_cpu
         _engine = PPStructureV3(
             lang=config.PADDLE_LANG,
             use_formula_recognition=True,
@@ -44,10 +46,24 @@ def _get_engine():
             use_textline_orientation=False,
             use_seal_recognition=False,
             use_chart_recognition=False,
-            device='gpu' if config.PADDLE_USE_GPU else 'cpu',
+            device='gpu' if use_gpu else 'cpu',
             enable_mkldnn=False,
         )
     return _engine
+
+
+def _predict(infer_path):
+    '''Инференс с одноразовым откатом на CPU при сбое GPU (например OOM).'''
+    global _engine, _force_cpu
+    try:
+        return next(iter(_get_engine().predict(infer_path)), None)
+    except Exception as error:
+        if _force_cpu or not config.PADDLE_USE_GPU:
+            raise
+        print(f'[paddle] сбой инференса на GPU ({error}); откат на CPU')
+        _force_cpu = True
+        _engine = None
+        return next(iter(_get_engine().predict(infer_path)), None)
 
 
 @contextmanager
@@ -138,12 +154,42 @@ def _to_items(blocks, width, height):
     return items
 
 
+_EMPTY_MATH_RE = re.compile(r'\\math(?:rm|sf|bf|it|cal|tt)\{\s*\}')
+_ENV_RE = re.compile(r'\\(?:begin|end)\{([^{}]*)\}')
+# Окружения, которые MathJax рендерит как в PDF (системы, матрицы).
+_ENV_WHITELIST = frozenset((
+    'cases', 'matrix', 'pmatrix', 'bmatrix', 'vmatrix', 'aligned',
+    'array', 'gathered',
+))
+
+
+def _clean_environments(latex):
+    '''Оставляет парные окружения из белого списка, прочие вырезает.'''
+    keep = {
+        env for env in re.findall(r'\\begin\{([^{}]*)\}', latex)
+        if env in _ENV_WHITELIST and f'\\end{{{env}}}' in latex
+    }
+    latex = _ENV_RE.sub(
+        lambda m: m.group(0) if m.group(1) in keep else '', latex,
+    )
+    return latex, bool(keep)
+
+
 def _clean_formula(latex):
-    '''Нормализует LaTeX формулы к одинарному $...$.'''
+    '''Нормализует LaTeX формулы к одинарному $...$, убирает OCR-мусор.'''
     latex = (latex or '').strip()
     for wrap in ('$$', '$', r'\[', r'\]', r'\(', r'\)'):
         latex = latex.replace(wrap, '')
-    latex = re.sub(r'\\begin\{.*?\}|\\end\{.*?\}', '', latex)
+    latex, has_env = _clean_environments(latex)
+    if not has_env:
+        latex = re.sub(r'(?<!\\)&', '', latex)
+    latex = latex.replace('�', '')
+    while True:
+        stripped = _EMPTY_MATH_RE.sub('', latex)
+        if stripped == latex:
+            break
+        latex = stripped
+    latex = re.sub(r'I(?=\d)|(?<=\d)I', '1', latex)
     latex = latex.strip()
     return f'${latex}$' if latex else ''
 
@@ -290,7 +336,7 @@ def parse_page(image_path, page=None, start_num=0):
     '''Возвращает список задач со страницы варианта.'''
     try:
         with _inference_image(image_path) as (infer_path, width, height):
-            result = next(iter(_get_engine().predict(infer_path)), None)
+            result = _predict(infer_path)
         if result is None:
             return []
         items = _to_items(_result_blocks(result), width, height)
@@ -357,7 +403,7 @@ def recognize_answer_table(image_path):
     '''Распознаёт таблицу ответов части 2 → {номер: html_ответ}.'''
     try:
         with _inference_image(image_path) as (infer_path, _w, _h):
-            result = next(iter(_get_engine().predict(infer_path)), None)
+            result = _predict(infer_path)
         if result is None:
             return {}
         blocks = _result_blocks(result)
@@ -390,7 +436,8 @@ def _qa_flag(task_num, condition):
         reasons.append('пустое условие')
     if condition.count('$') % 2 != 0:
         reasons.append('непарный $')
-    if condition.count('{') != condition.count('}'):
+    structural = re.sub(r'\\[{}]', '', condition)
+    if structural.count('{') != structural.count('}'):
         reasons.append('непарная {}')
     if reasons:
         print(f'[paddle][qa] задача {task_num}: {", ".join(reasons)}')

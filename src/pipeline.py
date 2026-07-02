@@ -6,6 +6,8 @@ import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
+import fitz
+
 from . import config, larin_answers
 from .classifier import classify_task, load_categories
 from .cropper import crop_figure, save_native_image
@@ -15,9 +17,20 @@ from .paddle_parser import parse_page
 from .pdf_render import render_pdf
 from .solver import solve_task
 from .textfmt import clean_html
+from .vision_parser import parse_conditions
 
 _SUBPART_RE = re.compile(r'^\s*(\d+)[\s.)]*[А-Яа-яA-Za-z][\s.)]*$')
 _TASK_NUM_RE = re.compile(r'\d+')
+_PDF_TASK_RE = re.compile(r'^\s*(\d{1,2})\s*[.)]\s*(.*)')
+_PDF_WORD_RE = re.compile(r'[0-9A-Za-zА-Яа-яЁё]+')
+_HTML_SPLIT_RE = re.compile(r'(<[^>]+>|\$[^$]*\$)')
+_NOISE_RE = re.compile(
+    r'(единый\s+государственный\s+экзамен|математика,?\s*\d+\s*класс|'
+    r'тренировочный\s+вариант|alexlarin|ответом\s+к\s+заданиям|'
+    r'инструкция\s+по\s+выполнению|часть\s+\d|бланк\s+ответов|'
+    r'не\s+забудьте|запишите\s+число)',
+    re.IGNORECASE,
+)
 
 
 def _task_int(task_num):
@@ -88,6 +101,101 @@ def _safe_name(task_num, counter):
     return f'task_{slug}.webp'
 
 
+def _pdf_task_texts(pdf_path):
+    '''Извлекает сырой текст задач из текстового слоя PDF для ремонта OCR.'''
+    tasks = {}
+    current = None
+    document = fitz.open(pdf_path)
+    try:
+        for page in document:
+            for raw_line in page.get_text('text').splitlines():
+                line = re.sub(r'\s+', ' ', raw_line.replace('\xa0', ' '))
+                line = line.strip()
+                if not line:
+                    continue
+                match = _PDF_TASK_RE.match(line)
+                if match:
+                    num = int(match.group(1))
+                    if 1 <= num <= config.PADDLE_MAX_TASK:
+                        current = num
+                        tail = match.group(2).strip()
+                        tasks.setdefault(current, [])
+                        if tail:
+                            tasks[current].append(tail)
+                    continue
+                if current is None:
+                    continue
+                if line.lower().startswith('ответ:'):
+                    continue
+                if _NOISE_RE.search(line):
+                    continue
+                tasks[current].append(line)
+    finally:
+        document.close()
+    return {num: ' '.join(lines) for num, lines in tasks.items()}
+
+
+_HOMOGLYPH_MAP = str.maketrans({
+    'a': 'а', 'e': 'е', 'o': 'о', 'p': 'р', 'c': 'с', 'x': 'х', 'y': 'у',
+})
+
+
+def _normalize_script(text):
+    '''Сводит латинские омоглифы к кириллице, чтобы OCR не путал буквы.'''
+    return text.translate(_HOMOGLYPH_MAP)
+
+
+def _segment_token(token, pdf_words):
+    '''Разбивает склеенный токен на цепочку соседних слов из PDF.'''
+    lower = _normalize_script(token.lower())
+    count = len(pdf_words)
+    for start in range(count):
+        word0 = _normalize_script(pdf_words[start].lower())
+        if not lower.startswith(word0):
+            continue
+        pos = len(word0)
+        stop = start + 1
+        while pos < len(lower) and stop < count:
+            word = _normalize_script(pdf_words[stop].lower())
+            if not lower.startswith(word, pos):
+                break
+            pos += len(word)
+            stop += 1
+        if pos != len(lower) or stop - start < 2:
+            continue
+        return ' '.join(pdf_words[start:stop])
+    return token
+
+
+def _repair_plain_text_spacing(text, pdf_text):
+    '''Вставляет пробелы там, где PDF содержит несколько соседних слов.'''
+    if not text or not pdf_text:
+        return text
+    pdf_words = [word for word in _PDF_WORD_RE.findall(pdf_text) if word]
+    if not pdf_words:
+        return text
+    text = _PDF_WORD_RE.sub(
+        lambda m: _segment_token(m.group(0), pdf_words), text,
+    )
+    text = re.sub(r'(?<!\d)([.,;:!?])(?=[^\s\d])', r'\1 ', text)
+    text = re.sub(r'(?<=[а-яёa-z])(?=[А-ЯЁA-Z])', ' ', text)
+    return re.sub(r'[ \t]{2,}', ' ', text)
+
+
+def _repair_condition_spacing(condition, pdf_text):
+    '''Чинит склейки слов в HTML, не заходя внутрь тегов и формул.'''
+    if not pdf_text:
+        return condition
+    parts = _HTML_SPLIT_RE.split(condition or '')
+    for index, part in enumerate(parts):
+        if not part or part.startswith('<') or (
+            part.startswith('$') and part.endswith('$')
+        ):
+            continue
+        parts[index] = _repair_plain_text_spacing(part, pdf_text)
+    return ''.join(parts)
+
+
 def _save_figure(match, page_path, image_name, images_dir):
     '''Сохраняет рисунок: нативное изображение или вырезку со страницы.'''
     data = match.get('image')
@@ -99,8 +207,9 @@ def _save_figure(match, page_path, image_name, images_dir):
     return crop_figure(page_path, match['box'], image_name, images_dir)
 
 
-def _parse_all_pages(page_paths, page_figures, images_dir):
+def _parse_all_pages(page_paths, page_figures, images_dir, pdf_texts=None):
     '''Парсинг страниц и вырезка рисунков (последовательно, без LLM).'''
+    pdf_texts = pdf_texts or {}
     records = []
     counter = 0
     last_num = 0
@@ -116,6 +225,7 @@ def _parse_all_pages(page_paths, page_figures, images_dir):
             num = _task_int(task.get('task_num'))
             if num is not None:
                 last_num = max(last_num, num)
+        vlm_conditions = parse_conditions(page_path)
         seeds = [
             task.get('figure_box') if task.get('has_figure') else None
             for task in tasks
@@ -125,7 +235,15 @@ def _parse_all_pages(page_paths, page_figures, images_dir):
         for task, match in zip(tasks, matches):
             counter += 1
             num = task.get('task_num', str(counter))
-            condition = clean_html(task.get('condition', ''))
+            task_int = _task_int(num)
+            vlm_condition = vlm_conditions.get(task_int, '')
+            if vlm_condition:
+                condition = clean_html(vlm_condition)
+            else:
+                condition = clean_html(task.get('condition', ''))
+                condition = _repair_condition_spacing(
+                    condition, pdf_texts.get(task_int, ''),
+                )
             image_name = ''
             if match is not None:
                 name = _safe_name(num, counter)
@@ -159,10 +277,10 @@ def _solve_record(record, categories, site_answers):
 
 
 def _process_pages(page_paths, page_figures, categories, images_dir,
-                   site_answers=None):
+                   site_answers=None, pdf_texts=None):
     '''Парсит последовательно, решает параллельно (SOLVER_WORKERS потоков).'''
     site_answers = site_answers or {}
-    records = _parse_all_pages(page_paths, page_figures, images_dir)
+    records = _parse_all_pages(page_paths, page_figures, images_dir, pdf_texts)
     rows = [None] * len(records)
     workers = max(1, config.SOLVER_WORKERS)
     with ThreadPoolExecutor(max_workers=workers) as executor:
@@ -203,11 +321,12 @@ def process_file(path):
               '(ожидается trvarNNN)')
     if suffix == '.pdf':
         page_figures = extract_page_figures(path)
+        pdf_texts = _pdf_task_texts(path)
         with tempfile.TemporaryDirectory() as tmp:
             page_paths = render_pdf(path, tmp)
             rows = _process_pages(
                 page_paths, page_figures, categories, images_dir,
-                site_answers,
+                site_answers, pdf_texts,
             )
     elif suffix in config.IMAGE_EXTENSIONS:
         rows = _process_pages(
